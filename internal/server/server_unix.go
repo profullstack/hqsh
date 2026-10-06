@@ -24,10 +24,13 @@ import (
 
 const (
 	startWait    = 3 * time.Second  // how long attach waits for a new daemon's socket
-	writeTimeout = 5 * time.Second  // a client that cannot take output this long is dropped
 	helloTimeout = 30 * time.Second // a daemon nobody says HELLO to gives up
 	socketCheck  = 5 * time.Second  // how often the daemon checks its socket file still exists
 )
+
+// writeTimeout: a client that cannot take one frame this long is dropped (it
+// reconnects and resumes). A var so tests can shorten it.
+var writeTimeout = 5 * time.Second
 
 // daemonCommand is the process attach starts when no daemon is listening.
 // Tests swap it to re-exec the test binary.
@@ -46,8 +49,9 @@ func Attach(session string) error {
 }
 
 // AttachIO is Attach over any pair of streams. It returns when either side
-// closes: the client went away, or the daemon dropped this connection (a
-// newer attach took over, or the shell exited).
+// closes: the client went away, or the daemon dropped this connection
+// (another client attached with --steal, the client fell too far behind, or
+// the shell exited).
 func AttachIO(session string, in io.Reader, out io.Writer) error {
 	if err := ValidSession(session); err != nil {
 		return err
@@ -126,14 +130,14 @@ func List() ([]SessionInfo, error) {
 	var out []SessionInfo
 	for _, p := range paths {
 		name := strings.TrimSuffix(filepath.Base(p), ".sock")
-		attached, err := status(p)
+		attached, clients, err := status(p)
 		if err != nil {
 			if isDead(err) {
 				os.Remove(p)
 			}
 			continue
 		}
-		out = append(out, SessionInfo{Name: name, Attached: attached})
+		out = append(out, SessionInfo{Name: name, Attached: attached, Clients: clients})
 	}
 	return out, nil
 }
@@ -142,40 +146,98 @@ func isDead(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
 }
 
-// status asks a daemon whether a client is attached.
-func status(path string) (bool, error) {
+// status asks a daemon whether clients are attached, and how many.
+func status(path string) (attached bool, clients int, err error) {
 	c, err := net.DialTimeout("unix", path, time.Second)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(2 * time.Second))
 	if err := proto.Write(c, proto.Frame{Type: proto.Status}); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	f, err := proto.Read(c)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	if f.Type != proto.Status || len(f.Payload) < 1 {
-		return false, fmt.Errorf("hqsh: unexpected status reply")
+	if f.Type != proto.Status {
+		return false, 0, fmt.Errorf("hqsh: unexpected status reply")
 	}
-	return f.Payload[0]&1 != 0, nil
+	return proto.DecodeStatus(f.Payload)
 }
 
-// daemon is one session: a PTY, its output ring, and at most one client.
+// daemon is one session: a PTY, its output ring, and the clients attached
+// to it (any number, tmux style: all of them see the output, and any of
+// them that is not read-only can type).
 type daemon struct {
 	session string
 	path    string
 	ring    *ring.Buffer
 
-	mu      sync.Mutex // guards everything below, and all writes to cur
-	cur     net.Conn
-	ptmx    *os.File
-	started bool
-	ln      net.Listener
+	mu         sync.Mutex // guards everything below
+	clients    map[*member]struct{}
+	ptmx       *os.File
+	started    bool
+	ln         net.Listener
+	cols, rows uint16 // the PTY's size: the smallest among the clients
+	exiting    bool   // the shell is gone; writers send EXIT once drained
+	exitCode   int
+	writers    sync.WaitGroup // one per attached client
+	progress   *sync.Cond     // on d.mu: a client took output, left, or the shell ended
 
 	exited chan struct{} // closed once the shell is gone and EXIT went out
+}
+
+// member is one attached connection. Its send queue is its cursor into the
+// shared ring (sent): output is written by its own goroutine, so a slow
+// client never stalls the PTY or the other clients. The queue is bounded by
+// the ring's budget: a client whose cursor falls off the ring, or that
+// cannot take a frame within writeTimeout, is dropped and comes back
+// through the resume (gap) path.
+type member struct {
+	c        net.Conn
+	readOnly bool
+	size     winsize // d.mu
+	sent     uint64  // newest seq written to it (d.mu)
+	acked    uint64  // newest seq it acknowledged, <= sent (d.mu)
+
+	wake chan struct{} // cap 1: there is new output, or the shell ended
+	done chan struct{} // closed when the client is dropped
+	once sync.Once
+	wmu  sync.Mutex // one frame at a time on c
+}
+
+func newMember(c net.Conn, h proto.HelloMsg) *member {
+	return &member{
+		c:        c,
+		readOnly: h.Flags&proto.HelloReadOnly != 0,
+		size:     winsize{h.Cols, h.Rows},
+		wake:     make(chan struct{}, 1),
+		done:     make(chan struct{}),
+	}
+}
+
+// write sends one frame, giving up after writeTimeout.
+func (cl *member) write(f proto.Frame) error {
+	cl.wmu.Lock()
+	defer cl.wmu.Unlock()
+	cl.c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return proto.Write(cl.c, f)
+}
+
+func (cl *member) poke() {
+	select {
+	case cl.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (cl *member) close() {
+	cl.once.Do(func() {
+		close(cl.done)
+		cl.c.Close()
+	})
 }
 
 // Daemon owns the PTY for one session and serves attaches on its socket. It
@@ -201,7 +263,9 @@ func Daemon(session string) error {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil // another daemon has it
 	}
-	d := &daemon{session: session, path: path, ring: ring.New(DefaultBuffer), exited: make(chan struct{})}
+	d := &daemon{session: session, path: path, ring: ring.New(DefaultBuffer),
+		clients: map[*member]struct{}{}, exited: make(chan struct{})}
+	d.progress = sync.NewCond(&d.mu)
 	if err := d.listen(); err != nil {
 		return err
 	}
@@ -281,12 +345,9 @@ func (d *daemon) serve(c net.Conn) {
 	switch f.Type {
 	case proto.Status:
 		d.mu.Lock()
-		var flags byte
-		if d.cur != nil {
-			flags = 1
-		}
+		n := len(d.clients)
 		d.mu.Unlock()
-		_ = proto.Write(c, proto.Frame{Type: proto.Status, Payload: []byte{flags}})
+		_ = proto.Write(c, proto.Frame{Type: proto.Status, Payload: proto.EncodeStatus(n)})
 		return
 	case proto.Hello:
 	default:
@@ -301,52 +362,47 @@ func (d *daemon) serve(c net.Conn) {
 		return
 	}
 
+	cl := newMember(c, h)
 	d.mu.Lock()
-	if d.cur != nil {
-		d.cur.Close() // a newer attach takes over
-	}
-	d.cur = c
-	chunks, gap := d.ring.Since(h.LastSeq)
-	if h.LastSeq > d.ring.Last() {
-		// The client printed output from an earlier daemon of this name.
-		chunks, _ = d.ring.Since(0)
-		gap = true
-	}
-	first := d.ring.Last() + 1
-	if len(chunks) > 0 {
-		first = chunks[0].Seq
-	}
-	var flags uint8
-	if gap {
-		flags = proto.WelcomeGap
-	}
-	ok := d.writeLocked(c, proto.Frame{Type: proto.Welcome, Payload: proto.WelcomeMsg{Version: proto.Version, FirstSeq: first, Flags: flags}.Encode()})
-	for _, ch := range chunks {
-		if !ok {
-			break
-		}
-		ok = d.writeLocked(c, proto.Frame{Type: proto.Output, Payload: proto.OutputMsg{Seq: ch.Seq, Data: ch.Data}.Encode()})
-	}
-	d.mu.Unlock()
-	if !ok {
+	if d.exiting {
+		code := d.exitCode
+		d.mu.Unlock()
+		_ = cl.write(proto.Frame{Type: proto.Exit, Payload: proto.EncodeExit(code)})
 		return
 	}
+	if h.Flags&proto.HelloSteal != 0 {
+		// tmux attach -d: everyone else is told and let go.
+		for o := range d.clients {
+			delete(d.clients, o)
+			go o.detach()
+		}
+		d.progress.Broadcast()
+	}
+	// Where this client's output starts: right after what it printed, or,
+	// when that is no longer buffered (or it printed output from an earlier
+	// daemon of this name), the oldest output still buffered.
+	from := h.LastSeq
+	first := d.ring.First()
+	gap := from > d.ring.Last() || from+1 < first
+	if gap {
+		from = first - 1
+	}
+	cl.sent, cl.acked = from, from
+	d.clients[cl] = struct{}{}
+	d.resizeLocked()
+	d.writers.Add(1)
+	d.mu.Unlock()
+	defer d.drop(cl)
 
-	d.setsize(h.Cols, h.Rows)
-	if gap && h.Rows > 1 {
-		// Nudge full-screen programs to repaint what the client lost.
-		d.setsize(h.Cols, h.Rows-1)
-		time.Sleep(50 * time.Millisecond)
-		d.setsize(h.Cols, h.Rows)
+	flags := proto.WelcomeShared
+	if gap {
+		flags |= proto.WelcomeGap
+	}
+	go d.writer(cl, proto.Frame{Type: proto.Welcome, Payload: proto.WelcomeMsg{Version: proto.Version, FirstSeq: from + 1, Flags: flags}.Encode()})
+	if gap {
+		d.nudge() // full-screen programs repaint what the client lost
 	}
 
-	defer func() {
-		d.mu.Lock()
-		if d.cur == c {
-			d.cur = nil
-		}
-		d.mu.Unlock()
-	}()
 	for {
 		f, err := proto.Read(c)
 		if err != nil {
@@ -354,6 +410,9 @@ func (d *daemon) serve(c net.Conn) {
 		}
 		switch f.Type {
 		case proto.Input:
+			if cl.readOnly {
+				continue // watching only
+			}
 			d.mu.Lock()
 			p := d.ptmx
 			d.mu.Unlock()
@@ -364,46 +423,135 @@ func (d *daemon) serve(c net.Conn) {
 			}
 		case proto.Resize:
 			if cols, rows, err := proto.DecodeResize(f.Payload); err == nil {
-				d.setsize(cols, rows)
+				d.mu.Lock()
+				cl.size = winsize{cols, rows}
+				d.resizeLocked()
+				d.mu.Unlock()
 			}
 		case proto.Ack:
 			if seq, err := proto.DecodeAck(f.Payload); err == nil {
-				d.ring.Trim(seq)
+				d.ack(cl, seq)
 			}
 		case proto.Ping:
-			d.mu.Lock()
-			ok := d.writeLocked(c, proto.Frame{Type: proto.Pong, Payload: f.Payload})
-			d.mu.Unlock()
-			if !ok {
+			if cl.write(proto.Frame{Type: proto.Pong, Payload: f.Payload}) != nil {
 				return
 			}
 		}
 	}
 }
 
-// writeLocked sends f to c (d.mu held). On failure it drops c.
-func (d *daemon) writeLocked(c net.Conn, f proto.Frame) bool {
-	c.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if err := proto.Write(c, f); err != nil {
-		c.Close()
-		if d.cur == c {
-			d.cur = nil
-		}
-		return false
-	}
-	return true
-}
-
-func (d *daemon) setsize(cols, rows uint16) {
-	if cols == 0 || rows == 0 {
+// writer sends cl its WELCOME, then every chunk after its cursor, oldest
+// first, then waits for more. It drops cl when a write fails or times out,
+// or when cl's cursor fell off the ring (the client reconnects and gets the
+// gap path). Once the shell is gone and cl is drained it sends EXIT.
+func (d *daemon) writer(cl *member, welcome proto.Frame) {
+	defer d.writers.Done()
+	defer d.drop(cl)
+	if cl.write(welcome) != nil {
 		return
 	}
-	d.mu.Lock()
-	p := d.ptmx
-	d.mu.Unlock()
-	if p != nil {
-		_ = pty.Setsize(p, &pty.Winsize{Cols: cols, Rows: rows})
+	for {
+		d.mu.Lock()
+		from, exiting, code := cl.sent, d.exiting, d.exitCode
+		d.mu.Unlock()
+		chunks, gap := d.ring.Since(from)
+		if gap {
+			return // fell behind past the buffer
+		}
+		for _, ch := range chunks {
+			if cl.write(proto.Frame{Type: proto.Output, Payload: proto.OutputMsg{Seq: ch.Seq, Data: ch.Data}.Encode()}) != nil {
+				return
+			}
+			d.mu.Lock()
+			cl.sent = ch.Seq
+			d.progress.Broadcast()
+			d.mu.Unlock()
+		}
+		if len(chunks) > 0 {
+			continue
+		}
+		if exiting {
+			_ = cl.write(proto.Frame{Type: proto.Exit, Payload: proto.EncodeExit(code)})
+			return
+		}
+		select {
+		case <-cl.wake:
+		case <-cl.done:
+			return
+		}
 	}
+}
+
+// ack records what cl has printed and trims the ring to what every
+// attached client has.
+func (d *daemon) ack(cl *member, seq uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if seq > cl.sent {
+		seq = cl.sent // it cannot have printed what it was never sent
+	}
+	if seq > cl.acked {
+		cl.acked = seq
+	}
+	acks := make([]uint64, 0, len(d.clients))
+	for o := range d.clients {
+		acks = append(acks, o.acked)
+	}
+	if upTo, ok := minAck(acks); ok {
+		d.ring.Trim(upTo) // under d.mu, so no client attaches mid-trim
+	}
+}
+
+// drop detaches cl (any number of times) and refits the PTY to the clients
+// left.
+func (d *daemon) drop(cl *member) {
+	d.mu.Lock()
+	if _, ok := d.clients[cl]; ok {
+		delete(d.clients, cl)
+		d.resizeLocked()
+		d.progress.Broadcast()
+	}
+	d.mu.Unlock()
+	cl.close()
+}
+
+// detach tells a client another one took the session (--steal), then lets
+// it go. The caller already removed it from d.clients.
+func (cl *member) detach() {
+	_ = cl.write(proto.Frame{Type: proto.Detached})
+	cl.close()
+}
+
+// resizeLocked sets the PTY to the smallest size among the attached
+// clients, when that changed (d.mu held).
+func (d *daemon) resizeLocked() {
+	sizes := make([]winsize, 0, len(d.clients))
+	for o := range d.clients {
+		sizes = append(sizes, o.size)
+	}
+	cols, rows, ok := minSize(sizes)
+	if !ok || (cols == d.cols && rows == d.rows) {
+		return
+	}
+	d.cols, d.rows = cols, rows
+	if d.ptmx != nil {
+		_ = pty.Setsize(d.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
+	}
+}
+
+// nudge makes full-screen programs repaint: one row less, then back.
+func (d *daemon) nudge() {
+	d.mu.Lock()
+	p, cols, rows := d.ptmx, d.cols, d.rows
+	d.mu.Unlock()
+	if p == nil || rows < 2 {
+		return
+	}
+	_ = pty.Setsize(p, &pty.Winsize{Cols: cols, Rows: rows - 1})
+	time.Sleep(50 * time.Millisecond)
+	d.mu.Lock()
+	_ = pty.Setsize(p, &pty.Winsize{Cols: d.cols, Rows: d.rows})
+	d.mu.Unlock()
 }
 
 // ensureShell starts the login shell on the first HELLO, so it gets that
@@ -432,6 +580,7 @@ func (d *daemon) ensureShell(h proto.HelloMsg) error {
 		return err
 	}
 	d.ptmx = ptmx
+	d.cols, d.rows = cols, rows
 	d.started = true
 	readDone := make(chan struct{})
 	go d.pump(ptmx, readDone)
@@ -448,17 +597,22 @@ func (d *daemon) ensureShell(h proto.HelloMsg) error {
 	return nil
 }
 
-// pump reads the PTY into the ring and on to the attached client.
+// pump reads the PTY into the ring and wakes every client's writer. It
+// never waits on one particular client: it pauses only while even the most
+// caught-up client is more than paceWindow behind (see mustWait).
 func (d *daemon) pump(ptmx *os.File, done chan struct{}) {
 	defer close(done)
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := ptmx.Read(buf)
 		if n > 0 {
+			d.ring.Append(buf[:n])
 			d.mu.Lock()
-			seq := d.ring.Append(buf[:n])
-			if d.cur != nil {
-				d.writeLocked(d.cur, proto.Frame{Type: proto.Output, Payload: proto.OutputMsg{Seq: seq, Data: buf[:n]}.Encode()})
+			for cl := range d.clients {
+				cl.poke()
+			}
+			for !d.exiting && mustWait(d.backlogsLocked(), paceWindow) {
+				d.progress.Wait()
 			}
 			d.mu.Unlock()
 		}
@@ -468,13 +622,37 @@ func (d *daemon) pump(ptmx *os.File, done chan struct{}) {
 	}
 }
 
-// finish tells the client the shell's status and takes the session down.
+// backlogsLocked is each attached client's unsent output in bytes (d.mu held).
+func (d *daemon) backlogsLocked() []int {
+	out := make([]int, 0, len(d.clients))
+	for cl := range d.clients {
+		out = append(out, d.ring.Behind(cl.sent))
+	}
+	return out
+}
+
+// finish lets every client drain its output and get the shell's status,
+// then takes the session down.
 func (d *daemon) finish(code int) {
 	d.mu.Lock()
-	if d.cur != nil {
-		d.writeLocked(d.cur, proto.Frame{Type: proto.Exit, Payload: proto.EncodeExit(code)})
-		d.cur.Close()
-		d.cur = nil
+	d.exiting, d.exitCode = true, code
+	for cl := range d.clients {
+		cl.poke()
+	}
+	d.progress.Broadcast()
+	d.mu.Unlock()
+	drained := make(chan struct{})
+	go func() {
+		d.writers.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(writeTimeout + time.Second):
+	}
+	d.mu.Lock()
+	for cl := range d.clients {
+		cl.close()
 	}
 	if d.ptmx != nil {
 		d.ptmx.Close()

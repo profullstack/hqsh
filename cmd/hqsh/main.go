@@ -1,7 +1,7 @@
 // hqsh: a terminal session that survives disconnects (like mosh) and carries
 // the raw stream, so images and every other escape reach your terminal.
 //
-//	hqsh [user@]host [--session NAME] [-- ssh flags...]
+//	hqsh [user@]host [--session NAME] [--steal | --read-only] [-- ssh flags...]
 //	hqsh server attach SESSION     (run by the client over ssh)
 //	hqsh server daemon SESSION     (started by attach; owns the PTY)
 //	hqsh server list [--json]      (live sessions on this host)
@@ -17,16 +17,23 @@ import (
 )
 
 // version is set by the release build (-ldflags "-X main.version=...").
-var version = "0.1.0"
+var version = "0.2.0"
 
 const usage = `hqsh: a terminal session that survives disconnects and carries images
 
 Usage:
-  hqsh [user@]host [--session NAME] [-- ssh flags...]
+  hqsh [user@]host [--session NAME] [--steal | --read-only] [-- ssh flags...]
   hqsh server attach SESSION
   hqsh server daemon SESSION
   hqsh server list [--json]
   hqsh version
+
+Several clients can attach to one session at once, like tmux: all of them
+see the output, any of them can type, and the window is the smallest of
+their sizes.
+  -s, --session NAME  the session (default "main")
+  -d, --steal         detach every other client first (tmux attach -d)
+  -r, --read-only     watch only; your keys are not sent
 
 Keys: Ctrl-^ then .  detach (the session keeps running)
       Ctrl-^ Ctrl-^  send a literal Ctrl-^
@@ -82,6 +89,10 @@ func run(args []string) (int, error) {
 			}
 			opts.Session = rest[i+1]
 			i++
+		case "--steal", "-d":
+			opts.Steal = true
+		case "--read-only", "-r":
+			opts.ReadOnly = true
 		case "--":
 			opts.SSHArgs = rest[i+1:]
 			i = len(rest)
