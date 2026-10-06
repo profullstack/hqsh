@@ -31,8 +31,12 @@ const (
 	Exit    Type = 9
 	// Status is local to the daemon socket and never crosses ssh: an empty
 	// Status asks a daemon about itself; it answers with one Status frame
-	// (flags u8, bit0: a client is attached) and closes the connection.
+	// (flags u8, bit0: a client is attached; then, from 0.2.0, the number of
+	// attached clients u16) and closes the connection.
 	Status Type = 10
+	// Detached tells a client that another client attached with --steal and
+	// took the session over: stop, do not reconnect. Empty payload. (0.2.0+)
+	Detached Type = 11
 )
 
 // Frame is one message.
@@ -82,26 +86,42 @@ type HelloMsg struct {
 	Rows    uint16
 	Session string
 	Term    string // the client's $TERM; optional, after a 0 byte
+	Flags   uint8  // HelloSteal, HelloReadOnly; optional, after a second 0 byte
 }
 
+// Hello flags (0.2.0+). With none set the attach is shared: every attached
+// client gets all output and any client's input reaches the shell.
+const (
+	// HelloSteal detaches every other client (each gets Detached), like
+	// `tmux attach -d`.
+	HelloSteal uint8 = 1
+	// HelloReadOnly attaches to watch: the daemon ignores this client's INPUT.
+	HelloReadOnly uint8 = 2
+)
+
 // Encode a Hello payload: the fixed fields, the session name, then (only
-// when Term is set) a 0 byte and Term.
+// when Term or Flags is set) a 0 byte and Term, then (only when Flags is
+// set) a 0 byte and the flags byte. A Hello without flags is byte for byte
+// what a 0.1.x client sends.
 func (h HelloMsg) Encode() []byte {
-	b := make([]byte, 14, 15+len(h.Session)+len(h.Term))
+	b := make([]byte, 14, 17+len(h.Session)+len(h.Term))
 	binary.BigEndian.PutUint16(b[0:], h.Version)
 	binary.BigEndian.PutUint64(b[2:], h.LastSeq)
 	binary.BigEndian.PutUint16(b[10:], h.Cols)
 	binary.BigEndian.PutUint16(b[12:], h.Rows)
 	b = append(b, h.Session...)
-	if h.Term != "" {
+	if h.Term != "" || h.Flags != 0 {
 		b = append(b, 0)
 		b = append(b, h.Term...)
+	}
+	if h.Flags != 0 {
+		b = append(b, 0, h.Flags)
 	}
 	return b
 }
 
 // DecodeHello parses a Hello payload. One without the 0 byte (an older
-// client) has an empty Term.
+// client) has an empty Term; one without the second 0 byte has no Flags.
 func DecodeHello(p []byte) (HelloMsg, error) {
 	if len(p) < 14 {
 		return HelloMsg{}, fmt.Errorf("hqsh: short hello (%d bytes)", len(p))
@@ -113,16 +133,30 @@ func DecodeHello(p []byte) (HelloMsg, error) {
 		Rows:    binary.BigEndian.Uint16(p[12:]),
 	}
 	rest := p[14:]
-	if i := bytes.IndexByte(rest, 0); i >= 0 {
-		h.Session, h.Term = string(rest[:i]), string(rest[i+1:])
-	} else {
+	i := bytes.IndexByte(rest, 0)
+	if i < 0 {
 		h.Session = string(rest)
+		return h, nil
+	}
+	h.Session, rest = string(rest[:i]), rest[i+1:]
+	if j := bytes.IndexByte(rest, 0); j >= 0 {
+		h.Term = string(rest[:j])
+		if len(rest) > j+1 {
+			h.Flags = rest[j+1]
+		}
+	} else {
+		h.Term = string(rest)
 	}
 	return h, nil
 }
 
 // WelcomeGap is the Welcome flag for "output you missed is gone; redraw".
 const WelcomeGap uint8 = 1
+
+// WelcomeShared is set by daemons that do shared attach (0.2.0+). A 0.1.x
+// daemon leaves it clear: there, every attach takes over, and the Hello
+// flags mean nothing.
+const WelcomeShared uint8 = 2
 
 // WelcomeMsg answers a Hello.
 type WelcomeMsg struct {
@@ -197,6 +231,34 @@ func EncodeAck(seq uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, seq)
 	return b
+}
+
+// EncodeStatus builds a Status reply: flags u8 (bit0: attached), clients u16.
+func EncodeStatus(clients int) []byte {
+	if clients > 0xffff {
+		clients = 0xffff
+	}
+	b := make([]byte, 3)
+	if clients > 0 {
+		b[0] = 1
+	}
+	binary.BigEndian.PutUint16(b[1:], uint16(clients))
+	return b
+}
+
+// DecodeStatus parses a Status reply. A 0.1.x daemon sends only the flags
+// byte; its client count is then 1 when attached, else 0.
+func DecodeStatus(p []byte) (attached bool, clients int, err error) {
+	if len(p) < 1 {
+		return false, 0, fmt.Errorf("hqsh: short status (%d bytes)", len(p))
+	}
+	attached = p[0]&1 != 0
+	if len(p) >= 3 {
+		clients = int(binary.BigEndian.Uint16(p[1:]))
+	} else if attached {
+		clients = 1
+	}
+	return attached, clients, nil
 }
 
 // DecodeAck parses an Ack payload.

@@ -35,6 +35,13 @@ type Options struct {
 	Remote  string   // the hqsh binary on the host; default tries "hqsh", then ~/.local/bin/hqsh
 	Term    string   // sent to the server as TERM; default $TERM
 
+	// Steal detaches every other client of the session (tmux attach -d), on
+	// the first connection only: a reconnect never kicks anyone.
+	Steal bool
+	// ReadOnly watches without typing: keys other than the detach escape
+	// are dropped here, and the daemon ignores this client's INPUT anyway.
+	ReadOnly bool
+
 	// Stdin, Stdout and Stderr default to the process's. Raw mode and window
 	// size apply only when Stdin/Stdout are terminals.
 	Stdin  io.Reader
@@ -113,15 +120,24 @@ func Run(o Options) (int, error) {
 		fmt.Fprintf(o.Stderr, "hqsh: detached; session %q keeps running on %s\n", o.Session, o.Host)
 		return 0, nil
 	}
+	if err == errStolen {
+		fmt.Fprintf(o.Stderr, "hqsh: detached by another client (--steal); session %q keeps running on %s\n", o.Session, o.Host)
+		return 0, nil
+	}
 	return code, err
 }
 
-var errQuit = errors.New("quit")
+var (
+	errQuit   = errors.New("quit")
+	errStolen = errors.New("stolen")
+)
 
 type runner struct {
 	o       Options
 	lastSeq uint64 // the newest output printed
 	remote  string
+
+	stoleOnce bool // a WELCOME arrived, so --steal has been applied
 
 	input    chan []byte
 	winch    chan struct{}
@@ -140,6 +156,7 @@ const (
 	lost outcome = iota
 	exited
 	quitting
+	stolen // another client attached with --steal
 )
 
 func (r *runner) run() (int, error) {
@@ -167,6 +184,8 @@ func (r *runner) run() (int, error) {
 				return code, nil
 			case quitting:
 				return 0, errQuit
+			case stolen:
+				return 0, errStolen
 			}
 			if !connected {
 				status, stderr := exitStatus(c)
@@ -262,6 +281,12 @@ func (r *runner) session(c io.ReadWriteCloser, afterOutage bool) (res outcome, c
 
 	cols, rows := r.size()
 	hello := proto.HelloMsg{Version: proto.Version, LastSeq: r.lastSeq, Cols: cols, Rows: rows, Session: r.o.Session, Term: r.o.Term}
+	if r.o.ReadOnly {
+		hello.Flags |= proto.HelloReadOnly
+	}
+	if r.o.Steal && !r.stoleOnce {
+		hello.Flags |= proto.HelloSteal
+	}
 	if err := send(proto.Frame{Type: proto.Hello, Payload: hello.Encode()}); err != nil {
 		return lost, 0, false
 	}
@@ -294,6 +319,7 @@ func (r *runner) session(c io.ReadWriteCloser, afterOutage bool) (res outcome, c
 				return lost, 0, true
 			}
 			welcomed = true
+			r.stoleOnce = true // reconnects never steal again
 			if afterOutage {
 				io.WriteString(r.o.Stdout, "\x1b[23;0t") // restore the saved title
 			}
@@ -327,6 +353,8 @@ func (r *runner) session(c io.ReadWriteCloser, afterOutage bool) (res outcome, c
 		case proto.Exit:
 			code, _ := proto.DecodeExit(f.Payload)
 			return exited, code, true
+		case proto.Detached:
+			return stolen, 0, true
 		}
 		return 0, 0, false
 	}
@@ -349,6 +377,9 @@ func (r *runner) session(c io.ReadWriteCloser, afterOutage bool) (res outcome, c
 				}
 			}
 		case b := <-r.input:
+			if r.o.ReadOnly {
+				continue // watching only
+			}
 			if send(proto.Frame{Type: proto.Input, Payload: b}) != nil {
 				return lost, 0, welcomed
 			}

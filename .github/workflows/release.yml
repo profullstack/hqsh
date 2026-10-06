@@ -4,6 +4,13 @@ on:
     tags: ["v*"]
 permissions:
   contents: write
+# v0.1.0 got two runs of this workflow for one tag (GitHub delivered two push
+# events 2 s apart; the trigger itself is single). Both raced to create the
+# release. One run per tag at a time, and Publish below is idempotent, so a
+# duplicate run waits and then only re-uploads the same assets.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   release:
     runs-on: ubuntu-latest

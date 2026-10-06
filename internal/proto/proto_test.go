@@ -97,3 +97,37 @@ func TestWelcomeAckExitPayloads(t *testing.T) {
 		}
 	}
 }
+
+func TestHelloFlags(t *testing.T) {
+	for _, h := range []HelloMsg{
+		{Version: Version, Cols: 80, Rows: 24, Session: "main", Term: "xterm-kitty", Flags: HelloSteal},
+		{Version: Version, Cols: 80, Rows: 24, Session: "main", Flags: HelloReadOnly},
+		{Version: Version, Cols: 80, Rows: 24, Session: "main", Term: "xterm", Flags: HelloSteal | HelloReadOnly},
+	} {
+		got, err := DecodeHello(h.Encode())
+		if err != nil || got != h {
+			t.Fatalf("hello %+v: got %+v %v", h, got, err)
+		}
+	}
+	// No flags: exactly the 0.1.x encoding (the shared default needs no bytes).
+	h := HelloMsg{Version: Version, Cols: 80, Rows: 24, Session: "main", Term: "xterm-kitty"}
+	if !bytes.HasSuffix(h.Encode(), []byte("main\x00xterm-kitty")) {
+		t.Fatalf("flagless hello changed: %q", h.Encode())
+	}
+}
+
+func TestStatusPayloads(t *testing.T) {
+	for _, n := range []int{0, 1, 3} {
+		a, c, err := DecodeStatus(EncodeStatus(n))
+		if err != nil || a != (n > 0) || c != n {
+			t.Fatalf("status %d: %v %d %v", n, a, c, err)
+		}
+	}
+	// A 0.1.x daemon answers with the flags byte alone.
+	if a, c, err := DecodeStatus([]byte{1}); err != nil || !a || c != 1 {
+		t.Fatalf("old status: %v %d %v", a, c, err)
+	}
+	if a, c, err := DecodeStatus([]byte{0}); err != nil || a || c != 0 {
+		t.Fatalf("old status: %v %d %v", a, c, err)
+	}
+}
