@@ -108,6 +108,16 @@ func windowsUTF16(b []uint16) []rune {
 	return r
 }
 
+// The WMI path (what runs where the ssh job refuses breakaway, as on CI)
+// starts a process outside our job. A harmless command: a WMI-started
+// process gets the user's default environment, not this test's.
+func TestWMIStartsAProcess(t *testing.T) {
+	cmd := exec.Command(os.Getenv("ComSpec"), "/c", "exit", "0")
+	if err := startWMI(cmd); err != nil {
+		t.Fatalf("Win32_Process.Create: %v", err)
+	}
+}
+
 // Whether this machine's job lets the daemon break away; informational (CI
 // runners differ), the start must work either way.
 func TestDaemonStartsWithoutTheForkOverride(t *testing.T) {
