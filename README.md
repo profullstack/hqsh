@@ -60,6 +60,27 @@ by itself. Details: [docs/protocol.md](docs/protocol.md#shared-attach).
 Sessions started by hqsh 0.1.x keep the old take-over behaviour until they
 end; attach again after `exit` to get a 0.2.0 daemon.
 
+## On the host: systemd, launchd
+
+There is no port to open and nothing to enable for hqsh itself: ssh runs
+`hqsh server attach`, which starts the session's daemon when it is not
+running. The daemon is started by the OS service manager where there is one:
+
+| host | the session daemon runs as | survives logout |
+| --- | --- | --- |
+| Linux with systemd | a user unit, `hqsh-<session>.service` | yes, with lingering on |
+| macOS | a launchd job, `sh.hqterm.hqsh.<session>`, in `user/<uid>` | yes |
+| anything else | a detached process (setsid) | unless the OS kills it |
+
+`hqsh server setup` shows which applies and turns lingering on (`loginctl
+enable-linger`) where systemd needs it; `--check` only reports. Without
+lingering, logind stops a user's units at their last logout, so hqsh falls
+back to a detached process until it is enabled (root:
+`loginctl enable-linger USER`). With systemd, sessions show up in
+`systemctl --user status 'hqsh-*'` and log to `journalctl --user -u 'hqsh-*'`.
+`HQSH_SUPERVISOR=fork|systemd|launchd|auto` overrides the choice; a service
+manager that refuses falls back to a detached process.
+
 ## Why not mosh?
 
 Mosh keeps its own copy of the screen and syncs only text, so it drops images

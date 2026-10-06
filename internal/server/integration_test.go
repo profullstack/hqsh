@@ -30,6 +30,9 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	// Plain forks unless a test asks for the real service manager: a dev box
+	// with systemd must not grow hqsh-* units from every test run.
+	os.Setenv("HQSH_SUPERVISOR", SupervisorFork)
 	daemonCommand = func(session string) (*exec.Cmd, error) {
 		cmd := exec.Command(os.Args[0])
 		cmd.Env = append(os.Environ(), "HQSH_TEST_DAEMON=1", "HQSH_TEST_SESSION="+session)
