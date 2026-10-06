@@ -21,3 +21,6 @@ func Daemon(session string) error { return ErrUnsupported }
 
 // List is Unix-only.
 func List() ([]SessionInfo, error) { return nil, ErrUnsupported }
+
+// Setup is Unix-only.
+func Setup(w io.Writer, check bool) error { return ErrUnsupported }

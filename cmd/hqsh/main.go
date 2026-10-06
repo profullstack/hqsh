@@ -5,6 +5,7 @@
 //	hqsh server attach SESSION     (run by the client over ssh)
 //	hqsh server daemon SESSION     (started by attach; owns the PTY)
 //	hqsh server list [--json]      (live sessions on this host)
+//	hqsh server setup [--check]    (how sessions start here; enables linger)
 //	hqsh version
 package main
 
@@ -26,7 +27,14 @@ Usage:
   hqsh server attach SESSION
   hqsh server daemon SESSION
   hqsh server list [--json]
+  hqsh server setup [--check]
   hqsh version
+
+On the host, each session's daemon runs under the service manager: a
+systemd user unit hqsh-<session>.service on Linux (with lingering, so it
+survives logout; "hqsh server setup" turns that on), a launchd job on
+macOS, else a detached process. HQSH_SUPERVISOR=fork|systemd|launchd|auto
+overrides the choice.
 
 Several clients can attach to one session at once, like tmux: all of them
 see the output, any of them can type, and the window is the smallest of
@@ -60,6 +68,13 @@ func run(args []string) (int, error) {
 		fmt.Println("hqsh", version)
 		return 0, nil
 	case "server":
+		if len(args) >= 2 && args[1] == "setup" {
+			check := len(args) >= 3 && args[2] == "--check"
+			if err := server.Setup(os.Stdout, check); err != nil {
+				return 1, err
+			}
+			return 0, nil
+		}
 		if len(args) >= 2 && args[1] == "list" {
 			asJSON := len(args) >= 3 && args[2] == "--json"
 			sessions, err := server.List()

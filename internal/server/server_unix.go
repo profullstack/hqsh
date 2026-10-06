@@ -84,20 +84,13 @@ func startAndDial(session, path string) (net.Conn, error) {
 	if err := ensureDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
-	cmd, err := daemonCommand(session)
-	if err != nil {
+	// Under systemd or launchd where available, else a detached fork (see
+	// supervise_unix.go). A daemon that loses a start race exits at once and
+	// the winner's socket may still be coming up, so keep dialing until the
+	// deadline either way.
+	if err := startDaemon(session); err != nil {
 		return nil, err
 	}
-	// Its own session: no controlling terminal, and the ssh hangup that
-	// ends this attach never reaches it. stdio stays nil, i.e. /dev/null.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("hqsh: starting the daemon: %w", err)
-	}
-	// Reap it if it exits while we live (a daemon that loses a start race
-	// exits at once; the winner's socket may still be coming up, so keep
-	// dialing until the deadline either way).
-	go func() { _ = cmd.Wait() }()
 	deadline := time.Now().Add(startWait)
 	for {
 		c, err := net.Dial("unix", path)
