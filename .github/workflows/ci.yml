@@ -16,6 +16,10 @@ jobs:
           go-version: "1.26"
       - run: go vet ./...
       - run: go test ./...
+      # Show which service manager each OS really used (launchd on macOS,
+      # breakaway/WMI on Windows), not just that the suite passed.
+      - name: Service manager and Windows console, verbose
+        run: go test -count=1 -v -run "TestSessionRunsUnderTheRealServiceManager|TestWindowsSessionOnConPTY|TestDaemonStartsWithoutTheForkOverride|TestChooseSupervisor" ./internal/server
       - if: runner.os == 'Linux'
         run: go test -race ./...
       - run: go build ./cmd/hqsh

@@ -1,5 +1,3 @@
-//go:build !windows
-
 package server
 
 import (
@@ -13,10 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-
-	"github.com/creack/pty"
 
 	"github.com/profullstack/hqsh/internal/proto"
 	"github.com/profullstack/hqsh/internal/ring"
@@ -135,10 +130,6 @@ func List() ([]SessionInfo, error) {
 	return out, nil
 }
 
-func isDead(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT)
-}
-
 // status asks a daemon whether clients are attached, and how many.
 func status(path string) (attached bool, clients int, err error) {
 	c, err := net.DialTimeout("unix", path, time.Second)
@@ -170,7 +161,7 @@ type daemon struct {
 
 	mu         sync.Mutex // guards everything below
 	clients    map[*member]struct{}
-	ptmx       *os.File
+	con        console // the shell's terminal: a PTY, or a ConPTY on Windows
 	started    bool
 	ln         net.Listener
 	cols, rows uint16 // the PTY's size: the smallest among the clients
@@ -253,7 +244,7 @@ func Daemon(session string) error {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := lockSession(lock); err != nil {
 		return nil // another daemon has it
 	}
 	d := &daemon{session: session, path: path, ring: ring.New(DefaultBuffer),
@@ -284,7 +275,7 @@ func (d *daemon) listen() error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(d.path, 0o600); err != nil {
+	if err := chmodSocket(d.path); err != nil {
 		ln.Close()
 		return err
 	}
@@ -407,7 +398,7 @@ func (d *daemon) serve(c net.Conn) {
 				continue // watching only
 			}
 			d.mu.Lock()
-			p := d.ptmx
+			p := d.con
 			d.mu.Unlock()
 			if p != nil {
 				if _, err := p.Write(f.Payload); err != nil {
@@ -527,23 +518,23 @@ func (d *daemon) resizeLocked() {
 		return
 	}
 	d.cols, d.rows = cols, rows
-	if d.ptmx != nil {
-		_ = pty.Setsize(d.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
+	if d.con != nil {
+		_ = d.con.Resize(cols, rows)
 	}
 }
 
 // nudge makes full-screen programs repaint: one row less, then back.
 func (d *daemon) nudge() {
 	d.mu.Lock()
-	p, cols, rows := d.ptmx, d.cols, d.rows
+	p, cols, rows := d.con, d.cols, d.rows
 	d.mu.Unlock()
 	if p == nil || rows < 2 {
 		return
 	}
-	_ = pty.Setsize(p, &pty.Winsize{Cols: cols, Rows: rows - 1})
+	_ = p.Resize(cols, rows-1)
 	time.Sleep(50 * time.Millisecond)
 	d.mu.Lock()
-	_ = pty.Setsize(p, &pty.Winsize{Cols: d.cols, Rows: d.rows})
+	_ = p.Resize(d.cols, d.rows)
 	d.mu.Unlock()
 }
 
@@ -555,37 +546,28 @@ func (d *daemon) ensureShell(h proto.HelloMsg) error {
 	if d.started {
 		return nil
 	}
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-	cmd := exec.Command(shell, "-l")
-	if home, err := os.UserHomeDir(); err == nil {
-		cmd.Dir = home
-	}
-	cmd.Env = shellEnv(os.Environ(), usableTerm(h.Term), d.session)
 	cols, rows := h.Cols, h.Rows
 	if cols == 0 || rows == 0 {
 		cols, rows = 80, 24
 	}
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+	con, wait, err := startShell(d.session, h.Term, cols, rows)
 	if err != nil {
 		return err
 	}
-	d.ptmx = ptmx
+	d.con = con
 	d.cols, d.rows = cols, rows
 	d.started = true
 	readDone := make(chan struct{})
-	go d.pump(ptmx, readDone)
+	go d.pump(con, readDone)
 	go func() {
-		_ = cmd.Wait()
+		code := wait()
 		// Let the last output drain; a background job still holding the
 		// terminal must not keep the session alive.
 		select {
 		case <-readDone:
 		case <-time.After(500 * time.Millisecond):
 		}
-		d.finish(exitCode(cmd.ProcessState))
+		d.finish(code)
 	}()
 	return nil
 }
@@ -593,11 +575,11 @@ func (d *daemon) ensureShell(h proto.HelloMsg) error {
 // pump reads the PTY into the ring and wakes every client's writer. It
 // never waits on one particular client: it pauses only while even the most
 // caught-up client is more than paceWindow behind (see mustWait).
-func (d *daemon) pump(ptmx *os.File, done chan struct{}) {
+func (d *daemon) pump(con console, done chan struct{}) {
 	defer close(done)
 	buf := make([]byte, 32<<10)
 	for {
-		n, err := ptmx.Read(buf)
+		n, err := con.Read(buf)
 		if n > 0 {
 			d.ring.Append(buf[:n])
 			d.mu.Lock()
@@ -647,8 +629,8 @@ func (d *daemon) finish(code int) {
 	for cl := range d.clients {
 		cl.close()
 	}
-	if d.ptmx != nil {
-		d.ptmx.Close()
+	if d.con != nil {
+		d.con.Close()
 	}
 	d.mu.Unlock()
 	d.shutdown()
@@ -667,61 +649,4 @@ func (d *daemon) shutdown() {
 	default:
 		close(d.exited)
 	}
-}
-
-func exitCode(ps *os.ProcessState) int {
-	if ps == nil {
-		return 1
-	}
-	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		return 128 + int(ws.Signal())
-	}
-	return ps.ExitCode()
-}
-
-func shellEnv(env []string, term, session string) []string {
-	out := make([]string, 0, len(env)+2)
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "TERM=") || strings.HasPrefix(kv, "HQSH_SESSION=") {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return append(out, "TERM="+term, "HQSH_SESSION="+session)
-}
-
-// usableTerm keeps the client's TERM when this host has a terminfo entry for
-// it (xterm-kitty often is missing), else falls back to xterm-256color.
-func usableTerm(term string) string {
-	const fallback = "xterm-256color"
-	if term == "" || strings.ContainsAny(term, "/\\\x00") || strings.HasPrefix(term, ".") {
-		return fallback
-	}
-	var dirs []string
-	if t := os.Getenv("TERMINFO"); t != "" {
-		dirs = append(dirs, t)
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		dirs = append(dirs, filepath.Join(home, ".terminfo"))
-	}
-	if td := os.Getenv("TERMINFO_DIRS"); td != "" {
-		dirs = append(dirs, filepath.SplitList(td)...)
-	}
-	dirs = append(dirs, "/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo", "/usr/share/lib/terminfo", "/opt/homebrew/share/terminfo", "/usr/local/share/terminfo")
-	anyDir := false
-	for _, dir := range dirs {
-		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-			continue
-		}
-		anyDir = true
-		for _, sub := range []string{term[:1], fmt.Sprintf("%x", term[0])} {
-			if _, err := os.Stat(filepath.Join(dir, sub, term)); err == nil {
-				return term
-			}
-		}
-	}
-	if !anyDir {
-		return term // no terminfo database to check against; trust the client
-	}
-	return fallback
 }
