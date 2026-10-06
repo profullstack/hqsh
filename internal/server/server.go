@@ -3,20 +3,20 @@
 package server
 
 import (
-	"errors"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DefaultBuffer is how much output a session keeps for resuming (4 MiB).
 const DefaultBuffer = 4 << 20
 
-// ErrNotImplemented marks the parts of the stub still to be built.
-var ErrNotImplemented = errors.New("hqsh: not implemented yet")
-
-// SocketPath is where session's daemon listens:
-// $XDG_RUNTIME_DIR/hqsh/<session>.sock, else ~/.local/state/hqsh/.
-func SocketPath(session string) (string, error) {
+// SocketDir is where daemons listen: $XDG_RUNTIME_DIR/hqsh, else
+// ~/.local/state/hqsh.
+func SocketDir() (string, error) {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		home, err := os.UserHomeDir()
@@ -25,32 +25,60 @@ func SocketPath(session string) (string, error) {
 		}
 		dir = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(dir, "hqsh", session+".sock"), nil
+	return filepath.Join(dir, "hqsh"), nil
 }
 
-// Attach bridges stdin/stdout (the ssh pipe) to the session's daemon,
-// starting the daemon first when it is not running.
-//
-// TODO:
-//   - dial SocketPath(session); on ENOENT/ECONNREFUSED fork `hqsh server daemon <session>`
-//     detached (setsid), wait for the socket, dial again
-//   - copy frames both ways until either side closes
-func Attach(session string) error {
-	_ = session
-	return ErrNotImplemented
+// SocketPath is where session's daemon listens: <SocketDir>/<session>.sock.
+func SocketPath(session string) (string, error) {
+	dir, err := SocketDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, session+".sock"), nil
 }
 
-// Daemon owns the PTY for one session and serves attaches on its socket.
-//
-// TODO:
-//   - start $SHELL -l in a PTY (github.com/creack/pty) with TERM from the first HELLO
-//   - read PTY output into a ring.Buffer, sending OUTPUT frames to the attached client
-//   - one client at a time: a new attach replaces the old (send it nothing more)
-//   - HELLO: reply WELCOME, replay ring.Since(lastSeq); on a gap set the flag and
-//     nudge a redraw by resizing rows-1 then rows
-//   - INPUT -> PTY, RESIZE -> pty.Setsize, ACK -> ring.Trim, PING -> PONG
-//   - shell exits: send EXIT with its status, remove the socket, quit
-func Daemon(session string) error {
-	_ = session
-	return ErrNotImplemented
+// ValidSession rejects names that would escape the socket directory or not
+// fit in a socket path.
+func ValidSession(session string) error {
+	if session == "" || len(session) > 64 || session == "." || session == ".." ||
+		strings.ContainsAny(session, "/\\\x00") || strings.HasPrefix(session, ".") {
+		return fmt.Errorf("hqsh: bad session name %q (use letters, digits, - and _)", session)
+	}
+	return nil
+}
+
+// SessionInfo is one live session, as `hqsh server list --json` prints it.
+type SessionInfo struct {
+	Name     string `json:"name"`
+	Attached bool   `json:"attached"`
+}
+
+// WriteList prints sessions: a JSON array (always an array, [] when empty)
+// or one "name<TAB>attached|detached" line each.
+func WriteList(w io.Writer, sessions []SessionInfo, asJSON bool) error {
+	if asJSON {
+		if sessions == nil {
+			sessions = []SessionInfo{}
+		}
+		b, err := json.Marshal(sessions)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "%s\n", b)
+		return err
+	}
+	if len(sessions) == 0 {
+		_, err := fmt.Fprintln(w, "no sessions")
+		return err
+	}
+	for _, s := range sessions {
+		state := "detached"
+		if s.Attached {
+			state = "attached"
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", s.Name, state); err != nil {
+			return err
+		}
+	}
+	return nil
 }

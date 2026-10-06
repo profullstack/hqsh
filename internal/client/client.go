@@ -5,18 +5,45 @@ package client
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/term"
+
+	"github.com/profullstack/hqsh/internal/proto"
 )
 
-// ErrNotImplemented marks the parts of the stub still to be built.
-var ErrNotImplemented = errors.New("hqsh: not implemented yet")
+const (
+	pingEvery   = 5 * time.Second
+	deadAfter   = 15 * time.Second // no frame (PONG or anything) this long: reconnect
+	ackEvery    = 64 << 10
+	escapeByte  = 0x1e // Ctrl-^
+	installHint = "curl -fsSL https://hqterm.sh/install | sh"
+)
 
 // Options for a connection.
 type Options struct {
 	Host    string   // [user@]host, as ssh takes it
 	Session string   // default "main"
 	SSHArgs []string // extra ssh flags (-p, -i, ...)
-	Remote  string   // the hqsh binary on the host, default "hqsh"
+	Remote  string   // the hqsh binary on the host; default tries "hqsh", then ~/.local/bin/hqsh
+	Term    string   // sent to the server as TERM; default $TERM
+
+	// Stdin, Stdout and Stderr default to the process's. Raw mode and window
+	// size apply only when Stdin/Stdout are terminals.
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+
+	// Dial replaces ssh as the transport (tests, or a future WebSocket
+	// bridge). It must reach `hqsh server attach <session>`.
+	Dial func() (io.ReadWriteCloser, error)
 }
 
 // Backoff is the reconnect delay for attempt n (0-based): 0.5s doubling to 10s.
@@ -45,19 +72,466 @@ func SSHCommand(o Options) []string {
 	return append(argv, o.Host, remote, "server", "attach", session)
 }
 
-// Run connects and stays connected until the session exits or the user quits
-// with Ctrl-^ then '.'.
-//
-// TODO:
-//   - golang.org/x/term: raw mode, restore on exit; size from term.GetSize
-//   - loop: start SSHCommand, send HELLO{lastSeq, cols, rows}
-//   - OUTPUT: write to stdout, remember seq, ACK every ~64 KiB
-//   - stdin -> INPUT frames (watch for Ctrl-^ .), SIGWINCH -> RESIZE
-//   - PING every 5s; no PONG in 15s, EOF or a write error -> reconnect after Backoff(n),
-//     showing "hqsh: reconnecting…" in the window title (OSC 2), never on screen
-//   - WELCOME with the gap flag: clear the screen before the replay
-//   - EXIT: restore the terminal and return the shell's status
-func Run(o Options) error {
-	_ = o
-	return ErrNotImplemented
+// NoRemoteError: the host has no hqsh to run.
+type NoRemoteError struct{ Host string }
+
+func (e *NoRemoteError) Error() string {
+	return fmt.Sprintf("hqsh: %s has no hqsh (not on its PATH, nor in ~/.local/bin).\n"+
+		"Install it on the host, then run hqsh again:\n\n    ssh %s '%s'\n", e.Host, e.Host, installHint)
+}
+
+// Run connects and stays connected until the session exits (returning the
+// shell's exit status) or the user detaches with Ctrl-^ then '.' (returning 0).
+// It fails only when the first connection cannot be made.
+func Run(o Options) (int, error) {
+	if o.Session == "" {
+		o.Session = "main"
+	}
+	if o.Term == "" {
+		o.Term = os.Getenv("TERM")
+	}
+	if o.Stdin == nil {
+		o.Stdin = os.Stdin
+	}
+	if o.Stdout == nil {
+		o.Stdout = os.Stdout
+	}
+	if o.Stderr == nil {
+		o.Stderr = os.Stderr
+	}
+	r := &runner{
+		o:      o,
+		input:  make(chan []byte, 16),
+		winch:  make(chan struct{}, 1),
+		quit:   make(chan struct{}),
+		remote: o.Remote,
+	}
+	defer r.restoreTerminal()
+	code, err := r.run()
+	r.restoreTerminal()
+	if err == errQuit {
+		fmt.Fprintf(o.Stderr, "hqsh: detached; session %q keeps running on %s\n", o.Session, o.Host)
+		return 0, nil
+	}
+	return code, err
+}
+
+var errQuit = errors.New("quit")
+
+type runner struct {
+	o       Options
+	lastSeq uint64 // the newest output printed
+	remote  string
+
+	input    chan []byte
+	winch    chan struct{}
+	quit     chan struct{}
+	quitOnce sync.Once
+
+	rawOnce sync.Once
+	restore func()
+	stopSig func()
+}
+
+// outcome of one connection
+type outcome int
+
+const (
+	lost outcome = iota
+	exited
+	quitting
+)
+
+func (r *runner) run() (int, error) {
+	candidates := []string{r.o.Remote}
+	if r.o.Remote == "" {
+		candidates = []string{"hqsh", "~/.local/bin/hqsh"}
+	}
+	connected := false // got a WELCOME at least once
+	inOutage := false
+	attempt := 0
+	for {
+		r.o.Remote = candidates[0]
+		c, err := r.dial()
+		if err != nil {
+			if !connected {
+				return 1, err
+			}
+		} else {
+			res, code, welcomed := r.session(c, inOutage)
+			if welcomed {
+				connected, inOutage, attempt = true, false, 0
+			}
+			switch res {
+			case exited:
+				return code, nil
+			case quitting:
+				return 0, errQuit
+			}
+			if !connected {
+				status, stderr := exitStatus(c)
+				if status == 127 && len(candidates) > 1 {
+					candidates = candidates[1:]
+					continue
+				}
+				if status == 127 {
+					return 1, &NoRemoteError{Host: r.o.Host}
+				}
+				msg := strings.TrimSpace(stderr)
+				if msg == "" {
+					msg = fmt.Sprintf("the connection closed (status %d)", status)
+				}
+				return 1, fmt.Errorf("hqsh: could not reach %s: %s", r.o.Host, msg)
+			}
+		}
+		// Lost a live session: retry until it comes back or the user quits.
+		if !inOutage {
+			inOutage = true
+			// Save the title, then show the status there, never on screen.
+			io.WriteString(r.o.Stdout, "\x1b[22;0t\x1b]2;hqsh: reconnecting…\x07")
+		}
+		if r.sleep(Backoff(attempt)) {
+			return 0, errQuit
+		}
+		attempt++
+	}
+}
+
+// sleep waits d, dropping keystrokes typed while disconnected. True: quit.
+func (r *runner) sleep(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			return false
+		case <-r.quit:
+			return true
+		case <-r.input:
+		case <-r.winch:
+		}
+	}
+}
+
+func (r *runner) dial() (io.ReadWriteCloser, error) {
+	if r.o.Dial != nil {
+		return r.o.Dial()
+	}
+	return dialSSH(SSHCommand(r.o))
+}
+
+// session runs one connection until it ends.
+func (r *runner) session(c io.ReadWriteCloser, afterOutage bool) (res outcome, code int, welcomed bool) {
+	var wmu sync.Mutex
+	send := func(f proto.Frame) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		return proto.Write(c, f)
+	}
+	var heard atomic.Int64
+	heard.Store(time.Now().UnixNano())
+	stop := make(chan struct{})
+	defer func() {
+		close(stop)
+		c.Close()
+	}()
+
+	// Watchdog: ping, and cut a connection that has gone quiet. Closing it
+	// unblocks any read or write stuck on it.
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		lastPing := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-t.C:
+				if now.Sub(time.Unix(0, heard.Load())) > deadAfter {
+					c.Close()
+					return
+				}
+				if now.Sub(lastPing) >= pingEvery && wmu.TryLock() {
+					_ = proto.Write(c, proto.Frame{Type: proto.Ping, Payload: make([]byte, 8)})
+					wmu.Unlock()
+					lastPing = now
+				}
+			}
+		}
+	}()
+
+	cols, rows := r.size()
+	hello := proto.HelloMsg{Version: proto.Version, LastSeq: r.lastSeq, Cols: cols, Rows: rows, Session: r.o.Session, Term: r.o.Term}
+	if err := send(proto.Frame{Type: proto.Hello, Payload: hello.Encode()}); err != nil {
+		return lost, 0, false
+	}
+
+	frames := make(chan proto.Frame, 64)
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			f, err := proto.Read(c)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			select {
+			case frames <- f:
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	unacked := 0
+	// handle one frame; done reports the connection is over.
+	handle := func(f proto.Frame) (res outcome, code int, done bool) {
+		heard.Store(time.Now().UnixNano())
+		switch f.Type {
+		case proto.Welcome:
+			w, err := proto.DecodeWelcome(f.Payload)
+			if err != nil {
+				return lost, 0, true
+			}
+			welcomed = true
+			if afterOutage {
+				io.WriteString(r.o.Stdout, "\x1b[23;0t") // restore the saved title
+			}
+			if w.Gap() {
+				// What we missed is gone: start clean from what the server has.
+				io.WriteString(r.o.Stdout, "\x1b[2J\x1b[H")
+				if w.FirstSeq > 0 {
+					r.lastSeq = w.FirstSeq - 1
+				}
+			}
+			r.startInteractive()
+		case proto.Output:
+			o, err := proto.DecodeOutput(f.Payload)
+			if err != nil {
+				return lost, 0, true
+			}
+			if o.Seq <= r.lastSeq {
+				return 0, 0, false // already printed
+			}
+			if _, err := r.o.Stdout.Write(o.Data); err != nil {
+				return quitting, 0, true
+			}
+			r.lastSeq = o.Seq
+			unacked += len(o.Data)
+			if unacked >= ackEvery {
+				unacked = 0
+				if send(proto.Frame{Type: proto.Ack, Payload: proto.EncodeAck(r.lastSeq)}) != nil {
+					return lost, 0, true
+				}
+			}
+		case proto.Exit:
+			code, _ := proto.DecodeExit(f.Payload)
+			return exited, code, true
+		}
+		return 0, 0, false
+	}
+	for {
+		select {
+		case f := <-frames:
+			if res, code, done := handle(f); done {
+				return res, code, welcomed
+			}
+		case <-readErr:
+			// Finish what arrived before the error (e.g. the last output and EXIT).
+			for {
+				select {
+				case f := <-frames:
+					if res, code, done := handle(f); done {
+						return res, code, welcomed
+					}
+				default:
+					return lost, 0, welcomed
+				}
+			}
+		case b := <-r.input:
+			if send(proto.Frame{Type: proto.Input, Payload: b}) != nil {
+				return lost, 0, welcomed
+			}
+		case <-r.winch:
+			cols, rows := r.size()
+			if send(proto.Frame{Type: proto.Resize, Payload: proto.EncodeResize(cols, rows)}) != nil {
+				return lost, 0, welcomed
+			}
+		case <-r.quit:
+			return quitting, 0, welcomed
+		}
+	}
+}
+
+// startInteractive puts the terminal in raw mode and starts reading keys,
+// once, after the first WELCOME (so ssh can still prompt before that).
+func (r *runner) startInteractive() {
+	r.rawOnce.Do(func() {
+		if f, ok := r.o.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+			if st, err := term.MakeRaw(int(f.Fd())); err == nil {
+				fd := int(f.Fd())
+				r.restore = func() { _ = term.Restore(fd, st) }
+			}
+		}
+		r.stopSig = watchSignals(r.winch, r.doQuit, r.size)
+		go r.readInput()
+	})
+}
+
+func (r *runner) restoreTerminal() {
+	if r.stopSig != nil {
+		r.stopSig()
+		r.stopSig = nil
+	}
+	if r.restore != nil {
+		r.restore()
+		r.restore = nil
+	}
+}
+
+func (r *runner) doQuit() { r.quitOnce.Do(func() { close(r.quit) }) }
+
+// readInput turns keystrokes into INPUT, handling the escape: Ctrl-^ '.'
+// detaches, Ctrl-^ Ctrl-^ sends one Ctrl-^, Ctrl-^ anything-else sends both.
+func (r *runner) readInput() {
+	buf := make([]byte, 4096)
+	esc := false
+	for {
+		n, err := r.o.Stdin.Read(buf)
+		if n > 0 {
+			out := make([]byte, 0, n+1)
+			for _, b := range buf[:n] {
+				switch {
+				case esc && b == '.':
+					r.doQuit()
+					return
+				case esc && b == escapeByte:
+					esc = false
+					out = append(out, escapeByte)
+				case esc:
+					esc = false
+					out = append(out, escapeByte, b)
+				case b == escapeByte:
+					esc = true
+				default:
+					out = append(out, b)
+				}
+			}
+			if len(out) > 0 {
+				select {
+				case r.input <- out:
+				case <-r.quit:
+					return
+				}
+			}
+		}
+		if err != nil {
+			r.doQuit() // stdin closed: nothing more to type
+			return
+		}
+	}
+}
+
+func (r *runner) size() (cols, rows uint16) {
+	if f, ok := r.o.Stdout.(*os.File); ok {
+		if w, h, err := term.GetSize(int(f.Fd())); err == nil && w > 0 && h > 0 {
+			return uint16(w), uint16(h)
+		}
+	}
+	return 80, 24
+}
+
+// sshConn is ssh's stdin and stdout as one stream.
+type sshConn struct {
+	cmd    *exec.Cmd
+	in     *os.File // our end of ssh's stdin
+	out    *os.File // our end of ssh's stdout
+	stderr *tail
+	done   chan struct{}
+	status int
+	once   sync.Once
+}
+
+func dialSSH(argv []string) (*sshConn, error) {
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		return nil, err
+	}
+	s := &sshConn{in: inW, out: outR, stderr: &tail{max: 4096}, done: make(chan struct{})}
+	s.cmd = exec.Command(argv[0], argv[1:]...)
+	// Real files, not Go-managed pipes, so Wait never closes our read end
+	// before we have read ssh's last bytes (the EXIT frame).
+	s.cmd.Stdin, s.cmd.Stdout, s.cmd.Stderr = inR, outW, s.stderr
+	err = s.cmd.Start()
+	inR.Close()
+	outW.Close()
+	if err != nil {
+		inW.Close()
+		outR.Close()
+		return nil, fmt.Errorf("hqsh: running ssh: %w", err)
+	}
+	go func() {
+		_ = s.cmd.Wait()
+		s.status = s.cmd.ProcessState.ExitCode()
+		close(s.done)
+	}()
+	return s, nil
+}
+
+func (s *sshConn) Read(p []byte) (int, error)  { return s.out.Read(p) }
+func (s *sshConn) Write(p []byte) (int, error) { return s.in.Write(p) }
+
+// Close ends ssh: closing its stdin lets it exit on its own; a hung one is
+// killed after 2s.
+func (s *sshConn) Close() error {
+	s.once.Do(func() {
+		s.in.Close()
+		select {
+		case <-s.done:
+		case <-time.After(2 * time.Second):
+			_ = s.cmd.Process.Kill()
+			<-s.done
+		}
+		s.out.Close()
+	})
+	return nil
+}
+
+// exitStatus is the remote command's status and ssh's stderr, when c is ssh.
+func exitStatus(c io.ReadWriteCloser) (int, string) {
+	s, ok := c.(*sshConn)
+	if !ok {
+		return -1, ""
+	}
+	s.Close()
+	return s.status, s.stderr.String()
+}
+
+// tail keeps the last max bytes written to it.
+type tail struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
 }
