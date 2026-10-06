@@ -60,6 +60,24 @@ by itself. Details: [docs/protocol.md](docs/protocol.md#shared-attach).
 Sessions started by hqsh 0.1.x keep the old take-over behaviour until they
 end; attach again after `exit` to get a 0.2.0 daemon.
 
+## Tailscale
+
+When Tailscale is running on your machine and the host is an online peer on
+your tailnet, hqsh connects over the peer's tailnet address. That path
+survives Wi-Fi and network changes better than a public IP, and needs no
+open port. hqsh matches the host by its machine name, its MagicDNS name, a
+tailnet IP, or what your ssh alias resolves to. Only the address changes
+(`-o HostName=<tailnet IP>`): the user, port and keys still come from your
+ssh config, and `HostKeyAlias` keeps the host's known_hosts entry. If the
+tailnet path fails on the first connect, hqsh uses the normal route.
+Reconnects alternate between the two, so whichever network is up wins.
+
+```
+hqsh dev2                    # auto: the tailnet when dev2 is a peer
+hqsh dev2 --tailscale on     # require it (fail if dev2 is not a peer)
+hqsh dev2 --tailscale off    # never; or HQSH_TAILSCALE=off
+```
+
 ## On the host: systemd, launchd
 
 There is no port to open and nothing to enable for hqsh itself: ssh runs
