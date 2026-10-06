@@ -155,10 +155,17 @@ func TestSessionRunsUnderTheRealServiceManager(t *testing.T) {
 			t.Fatalf("unit %s not active: %v %s", UnitName(session), err, out)
 		}
 	case SupervisorLaunchd:
-		out, err := runCmd("launchctl", "print", launchdDomain()+"/"+LaunchdLabel(session))
-		if err != nil || !strings.Contains(string(out), "state = running") {
-			t.Fatalf("launchd job not running: %v\n%s", err, out)
+		d, ok := launchdUsed.Load(session)
+		if !ok {
+			// It fell back to a fork: say why.
+			cmd, _ := daemonCommand("svc-probe")
+			t.Fatalf("launchd did not take the session: %v", startLaunchd("svc-probe", cmd))
 		}
+		out, err := runCmd("launchctl", "print", d.(string)+"/"+LaunchdLabel(session))
+		if err != nil || !strings.Contains(string(out), "state = running") {
+			t.Fatalf("launchd job not running in %s: %v\n%s", d, err, out)
+		}
+		t.Logf("session ran as a launchd job in %s", d)
 	}
 	c.send(proto.Input, []byte("echo under-"+r.Supervisor+"\n"))
 	c.until("\nunder-" + r.Supervisor + "\r\n")

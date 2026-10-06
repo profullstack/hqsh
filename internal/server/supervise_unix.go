@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -300,11 +301,20 @@ func startSystemd(session string, cmd *exec.Cmd) error {
 
 // ---------------------------------------------------------------- launchd ---
 
-func launchdDomain() string {
-	// Over ssh there is no GUI login, so the per-user domain is the one that
-	// exists; it survives the ssh connection.
-	return fmt.Sprintf("user/%d", os.Getuid())
+// launchdDomains are the domains a session job may go in, best first: the
+// GUI login's when the user has one (it is where their own agents run),
+// else the per-user background domain, which exists for ssh-only users too.
+// Both outlive the ssh connection.
+func launchdDomains() []string {
+	gui := fmt.Sprintf("gui/%d", os.Getuid())
+	user := fmt.Sprintf("user/%d", os.Getuid())
+	if _, err := runCmd("launchctl", "print", gui); err == nil {
+		return []string{gui, user}
+	}
+	return []string{user}
 }
+
+func launchdDomain() string { return launchdDomains()[0] }
 
 // LaunchdLabel is the launchd job label for a session.
 func LaunchdLabel(session string) string {
@@ -370,11 +380,19 @@ func startLaunchd(session string, cmd *exec.Cmd) error {
 	if err := os.WriteFile(plist, []byte(launchdPlist(label, argv, env)), 0o600); err != nil {
 		return err
 	}
-	domain := launchdDomain()
-	// A finished job stays loaded; unload the old one so the new one runs.
-	_, _ = runCmd("launchctl", "bootout", domain+"/"+label)
-	if out, err := runCmd("launchctl", "bootstrap", domain, plist); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %v: %s", err, strings.TrimSpace(string(out)))
+	var errs []string
+	for _, domain := range launchdDomains() {
+		// A finished job stays loaded; unload the old one so the new one runs.
+		_, _ = runCmd("launchctl", "bootout", domain+"/"+label)
+		out, err := runCmd("launchctl", "bootstrap", domain, plist)
+		if err == nil {
+			launchdUsed.Store(session, domain)
+			return nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v: %s", domain, err, strings.TrimSpace(string(out))))
 	}
-	return nil
+	return fmt.Errorf("launchctl bootstrap: %s", strings.Join(errs, "; "))
 }
+
+// launchdUsed remembers the domain each session's job went into.
+var launchdUsed sync.Map
