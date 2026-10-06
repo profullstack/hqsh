@@ -70,7 +70,13 @@ running. The daemon is started by the OS service manager where there is one:
 | --- | --- | --- |
 | Linux with systemd | a user unit, `hqsh-<session>.service` | yes, with lingering on |
 | macOS | a launchd job, `sh.hqterm.hqsh.<session>`, in `user/<uid>` | yes |
+| Windows 10 1809+ / Server 2019+ | a process outside the ssh connection's job (breakaway, else WMI `Win32_Process.Create`) on a ConPTY | yes |
 | anything else | a detached process (setsid) | unless the OS kills it |
+
+On Windows the session's shell is PowerShell 7 (`pwsh`), else Windows
+PowerShell, else `cmd.exe`; `HQSH_SHELL` picks another on any OS. The host
+needs the OpenSSH server (Settings → Optional features), and hqsh.exe on the
+PATH or in `~\.local\bin`.
 
 `hqsh server setup` shows which applies and turns lingering on (`loginctl
 enable-linger`) where systemd needs it; `--check` only reports. Without
@@ -105,8 +111,8 @@ tested end to end (a real shell over a pipe in CI, and over ssh by hand):
 reconnect after the connection dies, replay of exactly the missed output,
 detach and re-attach, exit status, Kitty and iTerm2 image escapes passed
 through untouched. 0.2.0 adds shared attach (several clients on one
-session), `--steal` and `--read-only`. The server side runs on Linux and macOS; the client also
-builds for Windows. Not yet: local echo prediction, a WebSocket bridge so a
+session), `--steal` and `--read-only`. The server side runs on Linux (systemd), macOS (launchd) and Windows (ConPTY); the client
+runs on all three. Not yet: local echo prediction, a WebSocket bridge so a
 phone/PWA can attach.
 
 Works with any modern terminal: Kitty, Ghostty, WezTerm, Rio, iTerm2,
