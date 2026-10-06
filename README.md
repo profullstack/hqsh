@@ -13,6 +13,26 @@ hqsh dev2 -- -p 2202      # extra ssh flags
 Close the laptop, change networks, lose Wi-Fi: when it comes back, hqsh
 reconnects and replays exactly the output you missed.
 
+`Ctrl-^ .` detaches (the shell keeps running; `hqsh dev2` picks it up
+again). `Ctrl-^ Ctrl-^` sends a literal `Ctrl-^`. When the shell exits,
+hqsh exits with its status.
+
+## Install
+
+hqsh must be on both ends: your machine and the host.
+
+```
+curl -fsSL https://hqterm.sh/install | sh
+```
+
+Or take a binary from [Releases](https://github.com/profullstack/hqsh/releases)
+(`hqsh-linux-amd64`, `hqsh-darwin-arm64`, ...), check it against
+`SHA256SUMS`, and put it on your PATH as `hqsh`. On the host,
+`~/.local/bin/hqsh` works even when that directory is not on the PATH ssh
+commands get.
+
+On the host, `hqsh server list` (or `--json`) shows the running sessions.
+
 ## Why not mosh?
 
 Mosh keeps its own copy of the screen and syncs only text, so it drops images
@@ -32,10 +52,13 @@ with backoff and resumes from the last output it printed. Full detail:
 
 ## Status
 
-**0.0.1: stub.** The wire format and the resume buffer are written and
-tested; the client loop and the PTY daemon are outlined (`TODO`s in
-`internal/client` and `internal/server`). Next: the daemon, then the client,
-then a WebSocket bridge so a phone/PWA can attach.
+**0.1.0: works.** The client, the PTY daemon and resume are implemented and
+tested end to end (a real shell over a pipe in CI, and over ssh by hand):
+reconnect after the connection dies, replay of exactly the missed output,
+detach and re-attach, exit status, Kitty and iTerm2 image escapes passed
+through untouched. The server side runs on Linux and macOS; the client also
+builds for Windows. Not yet: local echo prediction, a WebSocket bridge so a
+phone/PWA can attach.
 
 Works with any modern terminal: Kitty, Ghostty, WezTerm, Rio, iTerm2,
 Windows Terminal. hqtui apps (like `qc`) draw HD emoji through it.

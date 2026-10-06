@@ -56,3 +56,44 @@ func TestHelloAndOutputPayloads(t *testing.T) {
 		t.Fatal("short hello accepted")
 	}
 }
+
+func TestHelloCarriesTerm(t *testing.T) {
+	h := HelloMsg{Version: Version, LastSeq: 3, Cols: 80, Rows: 24, Session: "work", Term: "xterm-kitty"}
+	enc := h.Encode()
+	if !bytes.HasSuffix(enc, []byte("work\x00xterm-kitty")) {
+		t.Fatalf("encoding: %q", enc)
+	}
+	got, err := DecodeHello(enc)
+	if err != nil || got != h {
+		t.Fatalf("hello: %+v %v", got, err)
+	}
+}
+
+func TestHelloWithoutTermStaysCompatible(t *testing.T) {
+	// A 0.0.1 client sends no 0 byte; Term decodes empty and the session is intact.
+	h := HelloMsg{Version: Version, Cols: 80, Rows: 24, Session: "main"}
+	enc := h.Encode()
+	if bytes.IndexByte(enc[14:], 0) >= 0 {
+		t.Fatalf("empty Term must not add a separator: %q", enc)
+	}
+	got, err := DecodeHello(enc)
+	if err != nil || got.Session != "main" || got.Term != "" {
+		t.Fatalf("hello: %+v %v", got, err)
+	}
+}
+
+func TestWelcomeAckExitPayloads(t *testing.T) {
+	w := WelcomeMsg{Version: Version, FirstSeq: 12, Flags: WelcomeGap}
+	got, err := DecodeWelcome(w.Encode())
+	if err != nil || got != w || !got.Gap() {
+		t.Fatalf("welcome: %+v %v", got, err)
+	}
+	if s, err := DecodeAck(EncodeAck(1 << 40)); err != nil || s != 1<<40 {
+		t.Fatalf("ack: %d %v", s, err)
+	}
+	for _, code := range []int{0, 3, 130, -1} {
+		if c, err := DecodeExit(EncodeExit(code)); err != nil || c != code {
+			t.Fatalf("exit %d: %d %v", code, c, err)
+		}
+	}
+}
