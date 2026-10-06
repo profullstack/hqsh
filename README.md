@@ -60,6 +60,24 @@ by itself. Details: [docs/protocol.md](docs/protocol.md#shared-attach).
 Sessions started by hqsh 0.1.x keep the old take-over behaviour until they
 end; attach again after `exit` to get a 0.2.0 daemon.
 
+## Tailscale
+
+When Tailscale is running on your machine and the host is an online peer on
+your tailnet, hqsh connects over the peer's tailnet address. That path
+survives Wi-Fi and network changes better than a public IP, and needs no
+open port. hqsh matches the host by its machine name, its MagicDNS name, a
+tailnet IP, or what your ssh alias resolves to. Only the address changes
+(`-o HostName=<tailnet IP>`): the user, port and keys still come from your
+ssh config, and `HostKeyAlias` keeps the host's known_hosts entry. If the
+tailnet path fails on the first connect, hqsh uses the normal route.
+Reconnects alternate between the two, so whichever network is up wins.
+
+```
+hqsh dev2                    # auto: the tailnet when dev2 is a peer
+hqsh dev2 --tailscale on     # require it (fail if dev2 is not a peer)
+hqsh dev2 --tailscale off    # never; or HQSH_TAILSCALE=off
+```
+
 ## On the host: systemd, launchd
 
 There is no port to open and nothing to enable for hqsh itself: ssh runs
@@ -110,9 +128,11 @@ with backoff and resumes from the last output it printed. Full detail:
 tested end to end (a real shell over a pipe in CI, and over ssh by hand):
 reconnect after the connection dies, replay of exactly the missed output,
 detach and re-attach, exit status, Kitty and iTerm2 image escapes passed
-through untouched. 0.2.0 adds shared attach (several clients on one
-session), `--steal` and `--read-only`. The server side runs on Linux (systemd), macOS (launchd) and Windows (ConPTY); the client
-runs on all three. Not yet: local echo prediction, a WebSocket bridge so a
+through untouched. 0.2.0 added shared attach (several clients on one
+session), `--steal` and `--read-only`. 0.3.0 runs the server side under
+the OS service manager on Linux (systemd) and macOS (launchd), adds Windows
+hosts (ConPTY), and routes over Tailscale when the host is a peer. The
+client runs on all three. Not yet: local echo prediction, a WebSocket bridge so a
 phone/PWA can attach.
 
 Works with any modern terminal: Kitty, Ghostty, WezTerm, Rio, iTerm2,

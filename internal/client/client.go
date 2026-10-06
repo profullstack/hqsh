@@ -42,6 +42,13 @@ type Options struct {
 	// are dropped here, and the daemon ignores this client's INPUT anyway.
 	ReadOnly bool
 
+	// Tailscale is auto (default; $HQSH_TAILSCALE), on or off: whether to
+	// reach the host over its tailnet address when it is an online peer.
+	Tailscale string
+	// Via and ViaKeyAlias, set by Run when the tailnet is used, point ssh at
+	// the peer's tailnet address while keeping the host's known_hosts entry.
+	Via, ViaKeyAlias string
+
 	// Stdin, Stdout and Stderr default to the process's. Raw mode and window
 	// size apply only when Stdin/Stdout are terminals.
 	Stdin  io.Reader
@@ -75,7 +82,14 @@ func SSHCommand(o Options) []string {
 	if session == "" {
 		session = "main"
 	}
-	argv := append([]string{"ssh", "-T", "-o", "ServerAliveInterval=10"}, o.SSHArgs...)
+	argv := []string{"ssh", "-T", "-o", "ServerAliveInterval=10"}
+	if o.Via != "" {
+		argv = append(argv, "-o", "HostName="+o.Via)
+		if o.ViaKeyAlias != "" {
+			argv = append(argv, "-o", "HostKeyAlias="+o.ViaKeyAlias)
+		}
+	}
+	argv = append(argv, o.SSHArgs...)
 	return append(argv, o.Host, remote, "server", "attach", session)
 }
 
@@ -113,6 +127,23 @@ func Run(o Options) (int, error) {
 		quit:   make(chan struct{}),
 		remote: o.Remote,
 	}
+	if o.Dial == nil {
+		mode := o.Tailscale
+		if mode == "" {
+			mode = os.Getenv("HQSH_TAILSCALE")
+		}
+		if mode == "" {
+			mode = TailscaleAuto
+		}
+		if mode != TailscaleAuto && mode != TailscaleOn && mode != TailscaleOff {
+			return 2, fmt.Errorf("hqsh: --tailscale must be auto, on or off, not %q", mode)
+		}
+		addr, alias, err := tailnetRoute(o.Host, mode)
+		if err != nil {
+			return 1, err
+		}
+		r.tsAddr, r.tsAlias, r.tsRequired = addr, alias, mode == TailscaleOn
+	}
 	defer r.restoreTerminal()
 	code, err := r.run()
 	r.restoreTerminal()
@@ -138,6 +169,13 @@ type runner struct {
 	remote  string
 
 	stoleOnce bool // a WELCOME arrived, so --steal has been applied
+
+	// The tailnet route, when the host is a Tailscale peer: tried first; a
+	// first connection that fails over it falls back to the normal route, and
+	// reconnects alternate between the two unless --tailscale on.
+	tsAddr, tsAlias string
+	tsRequired      bool
+	tsBroken        bool // the first connection over the tailnet failed
 
 	input    chan []byte
 	winch    chan struct{}
@@ -169,9 +207,14 @@ func (r *runner) run() (int, error) {
 	attempt := 0
 	for {
 		r.o.Remote = candidates[0]
+		r.route(connected, attempt)
 		c, err := r.dial()
 		if err != nil {
 			if !connected {
+				if r.o.Via != "" && !r.tsRequired {
+					r.tsBroken = true // try the normal route
+					continue
+				}
 				return 1, err
 			}
 		} else {
@@ -196,6 +239,10 @@ func (r *runner) run() (int, error) {
 				if status == 127 {
 					return 1, &NoRemoteError{Host: r.o.Host}
 				}
+				if r.o.Via != "" && !r.tsRequired {
+					r.tsBroken = true // the tailnet path failed; try the normal route
+					continue
+				}
 				msg := strings.TrimSpace(stderr)
 				if msg == "" {
 					msg = fmt.Sprintf("the connection closed (status %d)", status)
@@ -213,6 +260,19 @@ func (r *runner) run() (int, error) {
 			return 0, errQuit
 		}
 		attempt++
+	}
+}
+
+// route picks the path for the next connection: the tailnet when there is
+// one (always with --tailscale on), except after it failed the first
+// connection; while reconnecting, every other attempt goes the normal way,
+// so whichever network is up wins.
+func (r *runner) route(connected bool, attempt int) {
+	use := r.tsAddr != "" && (r.tsRequired || (!r.tsBroken && (!connected || attempt%2 == 0)))
+	if use {
+		r.o.Via, r.o.ViaKeyAlias = r.tsAddr, r.tsAlias
+	} else {
+		r.o.Via, r.o.ViaKeyAlias = "", ""
 	}
 }
 
